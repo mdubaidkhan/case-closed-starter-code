@@ -1,9 +1,10 @@
 """
-Case Closed Agent — HYBRID: Expand → Fight → Fill
-- Early expansion with boost + center bias
+Case Closed Agent — HYBRID + Seal Mode + Deterministic Center Bias
+- Early expansion with safe boosts and center bias
 - Contested: adversarial 1-ply Voronoi + cut/separation bonus
-- Solo: Hamiltonian cycle follow (safe fill)
-- Safe reverse rule, robust tie-breakers, safe boost gate (engine boost=2; check 3 ahead)
+- Seal Mode: detect neck, race-check, short path commit to split map
+- Solo mode: Hamiltonian cycle follow (safe fill)
+- Safe reverse rule, robust tie-breakers, safe boost gate (engine boost=2; we check 3 ahead)
 
 Flask server compatible with the Judge.
 """
@@ -16,7 +17,7 @@ app = Flask(__name__)
 
 # Identity
 PARTICIPANT = os.getenv("PARTICIPANT", "UbaidK")
-AGENT_NAME  = os.getenv("AGENT_NAME",  "SmartAgent-HYBRID")
+AGENT_NAME  = os.getenv("AGENT_NAME",  "SmartAgent-HYBRID-SEAL")
 
 # Judge-populated state
 game_state = {
@@ -37,6 +38,11 @@ game_state = {
 DIRS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
 OPPOSITE = {"UP":"DOWN","DOWN":"UP","LEFT":"RIGHT","RIGHT":"LEFT"}
 INF = 10**9
+
+# --- Seal Mode state (module-level so it persists across requests) ---
+SEAL_MODE = False
+SEAL_PLAN = deque()   # sequence of directions to follow
+SEAL_TARGET = None    # neck cell (x,y) we're aiming for (for debug)
 
 # ----------------------------
 # Basic helpers
@@ -70,6 +76,14 @@ def path_clear(head, d, board, steps=3):
         if not open_cell(board, x, y):
             return False
     return True
+
+def center_bias_delta(board, x, y, nx, ny):
+    """Positive if moving to (nx,ny) goes more inward (closer to geometric center)."""
+    H, W = len(board), len(board[0])
+    cx, cy = (W-1)/2.0, (H-1)/2.0
+    d0 = abs(x - cx) + abs(y - cy)
+    d1 = abs(nx - cx) + abs(ny - cy)
+    return 1 if d1 < d0 else 0
 
 # ----------------------------
 # BFS / distances / components
@@ -154,6 +168,34 @@ def heads_connected(board, our_head, opp_head):
                 seen.add((nx,ny)); q.append((nx,ny))
     return False
 
+def shortest_path_dirs(board, start, target):
+    """BFS from start to target; returns list of directions or [] if none."""
+    if not (open_cell(board, *start) and open_cell(board, *target)):
+        return []
+    q = deque([start])
+    prev = {start: None}
+    while q:
+        x,y = q.popleft()
+        if (x,y) == target:
+            # reconstruct
+            path = []
+            cur = target
+            while prev[cur] is not None:
+                px,py = prev[cur]
+                dx,dy = cur[0]-px, cur[1]-py
+                for d,(ox,oy) in DIRS.items():
+                    if (ox,oy) == (dx,dy):
+                        path.append(d); break
+                cur = (px,py)
+            path.reverse()
+            return path
+        for d,(dx,dy) in DIRS.items():
+            nx,ny = x+dx, y+dy
+            if open_cell(board, nx, ny) and (nx,ny) not in prev:
+                prev[(nx,ny)] = (x,y)
+                q.append((nx,ny))
+    return []
+
 # ----------------------------
 # Hamiltonian cycle (serpentine) for even HxW
 # ----------------------------
@@ -186,7 +228,6 @@ def cycle_next_dir(nxt_map, x, y):
     for d,(ox,oy) in DIRS.items():
         if (ox,oy) == (dx,dy):
             return d
-    # Shouldn't happen on torus serpentine; fallback:
     return "RIGHT"
 
 # ----------------------------
@@ -230,10 +271,76 @@ def cut_bonus(board, opp_head, nx, ny):
     return (3.0 * gain + 5.0 * choke) if gain > 0 else (1.5 * choke)
 
 # ----------------------------
+# Seal Mode helpers
+# ----------------------------
+
+def find_neck_candidates(board, head, opp_head):
+    """Return list of (cell, gain_score) neck candidates adjacent to our head."""
+    cands = []
+    base = flood_component_size(board, opp_head[0], opp_head[1])
+    if base == 0: return cands
+    for d,(dx,dy) in DIRS.items():
+        nx,ny = head[0]+dx, head[1]+dy
+        if not open_cell(board, nx, ny): continue
+        saved = board[ny][nx]
+        board[ny][nx] = 1
+        after = flood_component_size(board, opp_head[0], opp_head[1])
+        board[ny][nx] = saved
+        gain = base - after
+        if gain > 0:
+            # Reward larger gains first
+            cands.append(((nx,ny), gain))
+    # sort by gain desc
+    cands.sort(key=lambda t: t[1], reverse=True)
+    return cands
+
+def try_build_seal_plan(board, head, opp_head, my_boosts, turn_count):
+    """
+    If a promising neck exists and we can win/tie the race, build a short BFS plan.
+    Returns deque of directions or empty deque if no plan.
+    """
+    if opp_head is None: return deque()
+    candidates = find_neck_candidates(board, head, opp_head)
+    if not candidates: return deque()
+
+    # distance maps for race
+    our_dist = compute_distance_map(board, head, max_expansions=400)
+    opp_dist = compute_distance_map(board, opp_head, max_expansions=400)
+
+    for (cx,cy), gain in candidates[:3]:  # check top few necks
+        du = our_dist[cy][cx]
+        dv = opp_dist[cy][cx]
+        if du == INF: continue  # can't reach
+        # race rule: we reach sooner, or we can tie with a safe boost
+        can_win = du < dv
+        can_tie_with_boost = (du == dv + 1 and my_boosts > 0 and True)
+        if not (can_win or can_tie_with_boost):
+            continue
+
+        # Plan shortest path to the neck
+        path_dirs = shortest_path_dirs(board, head, (cx,cy))
+        if not path_dirs: continue
+        # Cap plan to a few steps to avoid over-commit (2..6)
+        plan_len = max(2, min(6, len(path_dirs)))
+        plan = deque(path_dirs[:plan_len])
+
+        # Light safety: ensure first step is open now
+        d0 = plan[0]
+        nx,ny = next_pos_xy(*head, d0)
+        if not open_cell(board, nx, ny):
+            continue
+
+        return plan
+
+    return deque()
+
+# ----------------------------
 # Decision
 # ----------------------------
 
 def decide_move(my_trail, other_trail, turn_count, my_boosts):
+    global SEAL_MODE, SEAL_PLAN, SEAL_TARGET
+
     board = game_state.get("board")
     if board is None: return "RIGHT"
 
@@ -250,7 +357,7 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
         elif dy == 1: current_dir = "DOWN"
         elif dy == -1: current_dir = "UP"
 
-    # legal candidates (keep reverse if it's the only option)
+    # legal candidates (keep reverse if it's the only option, but verify it's actually open)
     all_legal = [d for d in DIRS if open_cell(board, *next_pos_xy(*head, d))]
     if not all_legal:
         return current_dir
@@ -267,6 +374,8 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
 
     # SOLO MODE: follow Hamiltonian cycle
     if SOLO:
+        SEAL_MODE = False
+        SEAL_PLAN.clear()
         nxt_map = get_cycle_map(board)
         d_cycle = cycle_next_dir(nxt_map, head[0], head[1])
         nx, ny = next_pos_xy(*head, d_cycle)
@@ -276,7 +385,37 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
             return f"{d_cycle}:BOOST" if use_boost else d_cycle
         # If blocked, fall through to normal scoring
 
-    # Scoring per phase
+    # --- SEAL MODE: if we already have a plan, try to follow it ---
+    if SEAL_MODE and SEAL_PLAN:
+        d = SEAL_PLAN[0]
+        nx, ny = next_pos_xy(*head, d)
+        if open_cell(board, nx, ny):
+            # optional safe boost during seal if clear path
+            allow_boost = (my_boosts > 0 and path_clear(head, d, board, steps=3)
+                           and 20 <= turn_count <= 80)
+            SEAL_PLAN.popleft()
+            if not SEAL_PLAN:   # plan consumed
+                SEAL_MODE = False
+            return f"{d}:BOOST" if allow_boost else d
+        else:
+            # plan invalid -> abort
+            SEAL_MODE = False
+            SEAL_PLAN.clear()
+
+    # --- Try to create a new seal plan (break symmetry) ---
+    if connected:
+        new_plan = try_build_seal_plan(board, head, opp_head, my_boosts, turn_count)
+        if new_plan:
+            SEAL_MODE = True
+            SEAL_PLAN = new_plan
+            # Take the first planned step now
+            d = SEAL_PLAN.popleft()
+            nx, ny = next_pos_xy(*head, d)
+            allow_boost = (my_boosts > 0 and path_clear(head, d, board, steps=3)
+                           and (EARLY or (30 <= turn_count <= 80)))
+            return f"{d}:BOOST" if allow_boost else d
+
+    # --- Normal scoring per phase ---
     best = None
     best_primary = None
 
@@ -299,16 +438,19 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
             if not connected and wall_distance(board, nx, ny) >= 2:
                 primary += 0.5
 
-        # Tie-breakers (lexicographic)
+        # Tie-breakers (lexicographic) with deterministic center bias
         straight = 1 if d == current_dir else 0
         deg_now = degree(board, nx, ny)
         fx, fy = next_pos_xy(nx, ny, d)
         w2 = degree(board, fx, fy) if open_cell(board, fx, fy) else 0
         wd = wall_distance(board, nx, ny)
+        inward = center_bias_delta(board, head[0], head[1], nx, ny)  # NEW
+
+        # small deterministic jitter to avoid perfect ties (no randomness)
         jitter = ((nx * 73856093) ^ (ny * 19349663) ^ (turn_count * 83492791)) & 7
         jitter *= 0.01
 
-        cand = (primary, straight, deg_now, deg_now + w2, wd, jitter, d)
+        cand = (primary, straight, inward, deg_now, deg_now + w2, wd, jitter, d)
         if best is None or cand > best:
             best = cand
             best_primary = primary
@@ -326,8 +468,8 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
     )
 
     # More aggressive boost early if lane is open & not hugging wall
-    if EARLY and not close:
-        nx, ny = next_pos_xy(*head, best_dir)
+    nx, ny = next_pos_xy(*head, best_dir)
+    if (turn_count < 30) and not close:
         allow_boost = allow_boost and (wall_distance(board, nx, ny) > 1)
 
     # Mid-game boost window
@@ -370,6 +512,12 @@ def send_move():
 
 @app.route("/end", methods=["POST"])
 def end_game():
+    # Reset seal state between games
+    global SEAL_MODE, SEAL_PLAN, SEAL_TARGET
+    SEAL_MODE = False
+    SEAL_PLAN.clear()
+    SEAL_TARGET = None
+
     data = request.get_json()
     if data:
         result = data.get("result", "UNKNOWN")
