@@ -1,13 +1,11 @@
 """
-Case Closed Agent — Hybrid Voronoi + Cut Bonus + Solo Cycle
-- Territory (Voronoi) adversarial 1-ply near contact
-- Area flood-fill when far (faster, stable)
-- Cut/separation bonus (pretend-occupy candidate cell)
-- Solo-mode Hamiltonian cycle follow when heads are disconnected
-- Early center bias, dynamic area depth
-- Safe boost (engine boost=2; we check 3 ahead for margin)
+Case Closed Agent — HYBRID: Expand → Fight → Fill
+- Early expansion with boost + center bias
+- Contested: adversarial 1-ply Voronoi + cut/separation bonus
+- Solo: Hamiltonian cycle follow (safe fill)
+- Safe reverse rule, robust tie-breakers, safe boost gate (engine boost=2; check 3 ahead)
 
-Drop-in Flask server compatible with the Judge.
+Flask server compatible with the Judge.
 """
 
 import os
@@ -18,7 +16,7 @@ app = Flask(__name__)
 
 # Identity
 PARTICIPANT = os.getenv("PARTICIPANT", "UbaidK")
-AGENT_NAME  = os.getenv("AGENT_NAME",  "SmartAgent-CycleCut")
+AGENT_NAME  = os.getenv("AGENT_NAME",  "SmartAgent-HYBRID")
 
 # Judge-populated state
 game_state = {
@@ -38,9 +36,10 @@ game_state = {
 # Directions
 DIRS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
 OPPOSITE = {"UP":"DOWN","DOWN":"UP","LEFT":"RIGHT","RIGHT":"LEFT"}
+INF = 10**9
 
 # ----------------------------
-# Utility helpers
+# Basic helpers
 # ----------------------------
 
 def in_bounds(board, x, y):
@@ -49,7 +48,7 @@ def in_bounds(board, x, y):
 def open_cell(board, x, y):
     return in_bounds(board, x, y) and board[y][x] == 0
 
-def next_pos(x, y, d):
+def next_pos_xy(x, y, d):
     dx, dy = DIRS[d]
     return x + dx, y + dy
 
@@ -73,10 +72,8 @@ def path_clear(head, d, board, steps=3):
     return True
 
 # ----------------------------
-# Flood fills / distances / components
+# BFS / distances / components
 # ----------------------------
-
-INF = 10**9
 
 def area_score(x, y, board, limit=60):
     if not open_cell(board, x, y): return 0
@@ -162,10 +159,6 @@ def heads_connected(board, our_head, opp_head):
 # ----------------------------
 
 def build_serpentine_cycle(W, H):
-    """
-    Build a Hamiltonian cycle mapping cell -> next cell on an even-by-even grid.
-    Simple snake rows that wrap; last cell connects back to first.
-    """
     order = []
     for y in range(H):
         row = list(range(W))
@@ -173,26 +166,12 @@ def build_serpentine_cycle(W, H):
             row.reverse()
         for x in row:
             order.append((x, y))
-    # connect to next row head tail via wrap
-    # Make it a cycle by linking last -> first
     nxt = {}
     for i,(x,y) in enumerate(order):
         nx,ny = order[(i+1) % len(order)]
         nxt[(x,y)] = (nx,ny)
     return nxt
 
-def cycle_next_dir(nxt_map, x, y):
-    nx, ny = nxt_map[(x,y)]
-    dx, dy = nx - x, ny - y
-    for d,(ox,oy) in DIRS.items():
-        if (ox,oy) == (dx,dy):
-            return d
-    # wrap differences (if any)
-    if dx == 0 and dy == - (len(nxt_map) // (len(set(p[0] for p in nxt_map)))):
-        return "UP"
-    return "RIGHT"  # fallback (shouldn't hit)
-
-# Precompute cycle once per board size
 _CYCLE_CACHE = {}
 def get_cycle_map(board):
     H, W = len(board), len(board[0])
@@ -201,17 +180,26 @@ def get_cycle_map(board):
         _CYCLE_CACHE[key] = build_serpentine_cycle(W,H)
     return _CYCLE_CACHE[key]
 
+def cycle_next_dir(nxt_map, x, y):
+    nx, ny = nxt_map[(x,y)]
+    dx, dy = nx - x, ny - y
+    for d,(ox,oy) in DIRS.items():
+        if (ox,oy) == (dx,dy):
+            return d
+    # Shouldn't happen on torus serpentine; fallback:
+    return "RIGHT"
+
 # ----------------------------
-# Scoring
+# Scoring (contested)
 # ----------------------------
 
 def score_move_voronoi_min(board, our_head_next, opp_head):
     """Adversarial 1-ply territory with head-on caution."""
-    opp_dirs = []
+    opp_dirs_xy = []
     for d,(dx,dy) in DIRS.items():
         ox, oy = opp_head[0]+dx, opp_head[1]+dy
-        if open_cell(board, ox, oy): opp_dirs.append((d,(ox,oy)))
-    if not opp_dirs:
+        if open_cell(board, ox, oy): opp_dirs_xy.append((ox,oy))
+    if not opp_dirs_xy:
         our_dist = compute_distance_map(board, our_head_next, max_expansions=400)
         our_cells = sum(1 for y in range(len(board)) for x in range(len(board[0]))
                         if board[y][x]==0 and our_dist[y][x] < INF)
@@ -219,7 +207,7 @@ def score_move_voronoi_min(board, our_head_next, opp_head):
 
     our_dist = compute_distance_map(board, our_head_next, max_expansions=400)
     worst = float('inf')
-    for _d,(ox,oy) in opp_dirs:
+    for (ox,oy) in opp_dirs_xy:
         opp_dist = compute_distance_map(board, (ox,oy), max_expansions=400)
         oc, pc, tc = territory_score_given_maps(board, our_dist, opp_dist)
         s = oc - 1.0*pc + 0.2*tc
@@ -230,19 +218,16 @@ def score_move_voronoi_min(board, our_head_next, opp_head):
 def cut_bonus(board, opp_head, nx, ny):
     """Pretend we occupy (nx,ny) -> how much does opponent component shrink?"""
     if not open_cell(board, nx, ny): return 0.0
-    # current opponent component size
     base = flood_component_size(board, opp_head[0], opp_head[1])
     if base == 0: return 0.0
-    # pretend occupy
     saved = board[ny][nx]
     board[ny][nx] = 1
     after = flood_component_size(board, opp_head[0], opp_head[1])
     board[ny][nx] = saved
     gain = base - after
-    # Also reward creating a choke (opponent degree near head small)
     near_deg = degree(board, opp_head[0], opp_head[1])
     choke = 1.0 if near_deg <= 2 else 0.0
-    return 3.0 * gain + 5.0 * choke if gain > 0 else 1.5 * choke
+    return (3.0 * gain + 5.0 * choke) if gain > 0 else (1.5 * choke)
 
 # ----------------------------
 # Decision
@@ -266,7 +251,7 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
         elif dy == -1: current_dir = "UP"
 
     # legal candidates (keep reverse if it's the only option)
-    all_legal = [d for d in DIRS if open_cell(board, *next_pos(*head, d))]
+    all_legal = [d for d in DIRS if open_cell(board, *next_pos_xy(*head, d))]
     if not all_legal:
         return current_dir
     directions = list(all_legal)
@@ -274,50 +259,56 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
     if opp_of_current in directions and len(directions) > 1:
         directions.remove(opp_of_current)
 
-    # SOLO MODE: if heads not connected, follow Hamiltonian cycle safely
-    if opp_head and not heads_connected(board, head, opp_head):
+    # Phase detection
+    EARLY = turn_count < 30
+    close = (opp_head is not None and manhattan(head, opp_head) <= 6)
+    connected = (opp_head is not None and heads_connected(board, head, opp_head))
+    SOLO = (opp_head is not None and not connected)
+
+    # SOLO MODE: follow Hamiltonian cycle
+    if SOLO:
         nxt_map = get_cycle_map(board)
-        # follow cycle if next cell open; else fall back to normal policy
         d_cycle = cycle_next_dir(nxt_map, head[0], head[1])
-        nx, ny = next_pos(*head, d_cycle)
+        nx, ny = next_pos_xy(*head, d_cycle)
         if open_cell(board, nx, ny):
-            # Optional parity/center nudges can be added here
             use_boost = (my_boosts > 0 and 30 <= turn_count <= 80
                          and path_clear(head, d_cycle, board, steps=3))
             return f"{d_cycle}:BOOST" if use_boost else d_cycle
-        # else, continue to normal scoring below
+        # If blocked, fall through to normal scoring
 
-    # Primary scoring (hybrid): Voronoi near, Area far (with early deeper area)
-    CLOSE_THRESH = 6
-    AREA_LIMIT = 60 if turn_count < 40 else 40
-
+    # Scoring per phase
     best = None
     best_primary = None
 
     for d in directions:
-        nx, ny = next_pos(*head, d)
+        nx, ny = next_pos_xy(*head, d)
         if not open_cell(board, nx, ny): continue
 
-        if opp_head and manhattan(head, opp_head) <= CLOSE_THRESH:
+        if opp_head and connected and close:
+            # CONTESTED: Voronoi + cut bonus
             primary = score_move_voronoi_min(board, (nx, ny), opp_head)
             primary += cut_bonus(board, opp_head, nx, ny)
-        else:
-            primary = area_score(nx, ny, board, limit=AREA_LIMIT)
-            # Early center bias (drift inward in opening)
-            if turn_count < 35 and wall_distance(board, nx, ny) >= 2:
+        elif EARLY and not close:
+            # EARLY EXPANSION: larger area cap + center bias
+            primary = area_score(nx, ny, board, limit=70)
+            if wall_distance(board, nx, ny) >= 2:
                 primary += 1.0
+        else:
+            # DEFAULT: moderate area lookahead
+            primary = area_score(nx, ny, board, limit=50)
+            if not connected and wall_distance(board, nx, ny) >= 2:
+                primary += 0.5
 
-        # tie-breakers (lexicographic)
+        # Tie-breakers (lexicographic)
         straight = 1 if d == current_dir else 0
-        deg = degree(board, nx, ny)
-        fx, fy = next_pos(nx, ny, d)
-        w1 = deg
+        deg_now = degree(board, nx, ny)
+        fx, fy = next_pos_xy(nx, ny, d)
         w2 = degree(board, fx, fy) if open_cell(board, fx, fy) else 0
         wd = wall_distance(board, nx, ny)
         jitter = ((nx * 73856093) ^ (ny * 19349663) ^ (turn_count * 83492791)) & 7
         jitter *= 0.01
 
-        cand = (primary, straight, deg, w1 + w2, wd, jitter, d)
+        cand = (primary, straight, deg_now, deg_now + w2, wd, jitter, d)
         if best is None or cand > best:
             best = cand
             best_primary = primary
@@ -327,15 +318,23 @@ def decide_move(my_trail, other_trail, turn_count, my_boosts):
 
     best_dir = best[-1]
 
-    # Safe boost gate (engine boost=2; check 3 ahead for margin)
-    use_boost = (
+    # Boost policy (safe & phase-aware)
+    allow_boost = (
         my_boosts > 0
-        and 30 <= turn_count <= 80
-        and path_clear(head, best_dir, board, steps=3)
+        and path_clear(head, best_dir, board, steps=3)  # engine boost=2; check 3 for margin
         and (best_primary is not None and best_primary > 5)
     )
 
-    return f"{best_dir}:BOOST" if use_boost else best_dir
+    # More aggressive boost early if lane is open & not hugging wall
+    if EARLY and not close:
+        nx, ny = next_pos_xy(*head, best_dir)
+        allow_boost = allow_boost and (wall_distance(board, nx, ny) > 1)
+
+    # Mid-game boost window
+    if 30 <= turn_count <= 80 and allow_boost:
+        return f"{best_dir}:BOOST"
+    else:
+        return best_dir
 
 # ----------------------------
 # Flask endpoints
