@@ -167,15 +167,15 @@ class Agent:
 class Game:
     def __init__(self):
         self.board = GameBoard()
-        self.agent1 = Agent(agent_id=1, start_pos=(1, 10), start_dir=Direction.RIGHT, board=self.board)
-        self.agent2 = Agent(agent_id=2, start_pos=(17, 10), start_dir=Direction.LEFT, board=self.board)
+        self.agent1 = Agent(agent_id=1, start_pos=(1, 2), start_dir=Direction.RIGHT, board=self.board)
+        self.agent2 = Agent(agent_id=2, start_pos=(17, 15), start_dir=Direction.LEFT, board=self.board)
         self.turns = 0
     
     def reset(self):
         """Resets the game to the initial state."""
         self.board = GameBoard()
-        self.agent1 = Agent(agent_id=1, start_pos=(1, 10), start_dir=Direction.RIGHT, board=self.board)
-        self.agent2 = Agent(agent_id=2, start_pos=(17, 10), start_dir=Direction.LEFT, board=self.board)
+        self.agent1 = Agent(agent_id=1, start_pos=(1, 2), start_dir=Direction.RIGHT, board=self.board)
+        self.agent2 = Agent(agent_id=2, start_pos=(17, 15), start_dir=Direction.LEFT, board=self.board)
         self.turns = 0
     
     def step(self, dir1: Direction, dir2: Direction, boost1: bool = False, boost2: bool = False):
